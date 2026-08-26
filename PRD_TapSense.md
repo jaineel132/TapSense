@@ -1,1465 +1,463 @@
-# Product Requirements Document (PRD)
-# TapSense
+# Product Requirements Document — TapSense
 
-**Document status:** Initial project definition  
-**Scope:** Local development and local use only  
-**Project type:** Windows desktop + local backend system  
-**Reference:** Holo (conceptual/architectural reference only; no code reuse)
+**Status:** Revision 2 — rewritten after Phase 0 feasibility testing
+**Scope:** Local-only, Windows-first
+**Supersedes:** Revision 1 (four-zone desk localization), which Phase 0 disproved
 
 ---
 
-## 1. Product Overview
+## 1. What changed, and why
 
-### 1.1 Product name
+Revision 1 specified **four desk zones** — tap the left-front corner, tap the right-rear corner,
+each triggers a different action. It was modelled on Holo, a macOS project.
 
-**TapSense**
+Phase 0 built a throwaway measurement spike (`spike/spike.py`) and tested that assumption on the
+target hardware before any product code was written. **It failed.**
 
-### 1.2 One-line description
+| Measurement | Result |
+|---|---|
+| 4-zone accuracy, same session | 68.7% |
+| 4-zone accuracy, **cross-session** (laptop moved 3cm) | **30.6%** (chance 25%) |
+| Best variant, any feature set | 40.6% |
+| Required to proceed | 85% |
 
-TapSense is a Windows-first desk interaction system that uses a laptop microphone to detect desk taps, infer which configured area of the desk was tapped, and trigger a user-defined computer action.
+The 38-point gap between same-session and cross-session is the whole story: the classifier was
+memorizing where the laptop sat, not learning where the desk was struck.
 
-### 1.3 Core idea
+**Root cause (physical, not fixable in software):** desk taps couple into the laptop *chassis* and
+travel at roughly 5000 m/s, not through air at 343 m/s. Structure-borne sound arrives at both
+microphones essentially simultaneously — measured inter-microphone delay was **+0.02 samples with a
+standard deviation of 0.05** across 40 taps. There is no time-of-arrival difference to measure.
+A microphone pair centimetres apart cannot recover one. Sub-sample GCC-PHAT estimation was tried and
+scored *worse*.
 
-A user places a Windows laptop on a stable desk and defines four interaction zones around it:
+Full evidence: [`spike/FINDINGS.md`](spike/FINDINGS.md).
 
-```text
-                    DISPLAY SIDE
+**Revision 2 drops localization entirely and uses the temporal pattern of taps instead.** This turns
+out to be the stronger design regardless — see §4.
 
-              LEFT REAR     RIGHT REAR
-                    ┌──────────────┐
-                    │              │
-                    │    LAPTOP    │
-                    │              │
-                    └──────────────┘
-              LEFT FRONT    RIGHT FRONT
+---
 
-                    TRACKPAD SIDE
+## 2. Product definition
+
+### 2.1 One line
+
+TapSense is a Windows desktop application that listens through the laptop microphone for deliberate
+tap *patterns* on the desk and triggers a configured action.
+
+### 2.2 The interaction
+
+| Gesture | Behaviour |
+|---|---|
+| One impulse | **Ignored.** This is the noise rejection doing its job. |
+| Two taps within 350ms | Fires the double-tap action |
+| Three taps within 700ms | Fires the triple-tap action |
+
+Tap anywhere on the desk. Position is irrelevant — only the rhythm matters.
+
+### 2.3 Why single tap is deliberately unusable
+
+A single impulse is indistinguishable from a mug being set down, a drawer closing, or a dropped pen.
+Binding an action to it guarantees false triggers, and a gesture system that fires when you did not
+gesture gets uninstalled within an hour.
+
+Two impulses at a controlled interval almost never occur by accident. **The rhythm is the signal,
+not the sound.** Discarding single taps is what makes the rest trustworthy.
+
+---
+
+## 3. Measured hardware constraints
+
+Established in Phase 0 on the development machine (Lenovo 83DV, Realtek microphone array). These are
+measurements, not assumptions — re-run `spike/spike.py devices` on any new machine.
+
+### 3.1 Use shared mode, not exclusive
+
+| Mode | Idle level (high-passed RMS) | Channels | Mic locked? |
+|---|---|---|---|
+| Shared | **0.00e+00** (gate fully closed) | mono, duplicated | No |
+| Exclusive | 3.1e-03 | 2 independent | **Yes** |
+
+Revision 1 would have required exclusive mode to reach the two independent microphones for
+time-delay measurement. That locks the microphone: no Zoom, no Discord, no voice input while
+TapSense runs.
+
+Localization is gone, so **the lock is gone with it.** Shared mode is sufficient and polite.
+Verified: two simultaneous shared-mode streams open and read on this device.
+
+### 3.2 The Windows noise gate is an asset
+
+Windows/Realtek audio processing gates to **digital silence** at rest, and knuckle taps pass through
+it cleanly:
+
+| | Level |
+|---|---|
+| Idle | 0.00e+00 |
+| Taps | 1.7e-05 to 5.8e-04 |
+| Gate artifacts | <= 3.3e-06 |
+
+Roughly 5x margin between the quietest tap and the loudest artifact.
+
+Consequence: **detection is an absolute threshold, not an adaptive noise floor.** Any non-zero
+energy is already a candidate event. This is simpler and more robust than the adaptive scheme
+Revision 1 implied.
+
+### 3.3 Detection operates on a high-passed signal
+
+Raw microphone RMS is dominated by sub-200Hz rumble — 89% of idle energy on this machine. A level
+detector on the raw signal measures the fan and the desk, not taps. Detection runs on a high-passed
+signal; a first difference (`np.diff`, +6dB/octave) was sufficient in Phase 0.
+
+### 3.4 Open question — behaviour during calls
+
+While someone is speaking, the noise gate is held open and idle stops being zero. Tap detection
+under continuous speech is **unmeasured**. Phase 2 must test it; false triggers mid-call would be a
+serious defect.
+
+---
+
+## 4. Why this design is better than Revision 1
+
+Not a consolation prize. Concretely:
+
+1. **It runs on any laptop.** No microphone geometry dependency, so no per-device model. Revision 1
+   §5 conceded it was "not a universal guarantee for every laptop" — that limitation disappears.
+2. **Calibration is one number, not a trained model.** Tap a few times, store a threshold.
+   Revision 1 needed labelled collection, training, held-out evaluation, model versioning, and
+   quality gates — for a model that decayed when the laptop moved.
+3. **Rejection is far stronger.** Temporal pattern matching beats spectral fingerprinting for
+   distinguishing intent, and intent-detection was always the genuinely hard part.
+4. **No microphone lock** (§3.1).
+5. **Light taps work.** The reason finger taps did not register in Phase 0 was the exclusive-mode
+   noise floor drowning them. Against a zero floor, a gentle tap at 1e-05 is plainly visible.
+
+### 4.1 What it costs
+
+Stated plainly, because these are real:
+
+- **Two actions, not four.** Possibly three if quadruple-tap proves reproducible — to be measured,
+  not assumed.
+- **Latency.** A double-tap cannot fire the instant the second tap lands; the system must wait to
+  confirm a third is not coming. See §6.
+- **It is not a hotkey replacement.** Its niche is when hands are away from the keyboard — pausing
+  music, muting a call.
+
+---
+
+## 5. Non-goals
+
+TapSense is not: a voice assistant; a cloud service; a keyboard or mouse replacement; a security or
+authentication mechanism; a tap *localization* system (Phase 0 disproved it); a macOS or Linux
+product in v1; a deployed or hosted system.
+
+---
+
+## 6. Gesture timing and latency budget
+
+```
+   tap 1      tap 2                      action
+     |          |                           |
+     +----------+---------------------------+
+       <=350ms        350ms confirm window
+                  (waiting for a possible tap 3)
 ```
 
-The user taps one of these zones. TapSense captures the microphone signal, determines whether the sound is likely to be a tap, extracts useful signal features, classifies the tap into a zone, decides whether the classification is trustworthy, and executes the action assigned to that zone.
+| Parameter | Value | Rationale |
+|---|---|---|
+| Refractory after each impulse | 80ms | Suppresses one tap's ringing counting twice; humans cannot deliberately tap faster than ~125ms apart |
+| Max gap between taps in a gesture | 350ms | Comfortable deliberate double-tap |
+| Confirm window after final tap | 350ms | Distinguishes double from triple |
+| **Total latency, final tap to action** | **<=400ms (p95)** | Acceptable for media control |
 
-Example:
+### 6.1 Latency optimisation worth building
 
-```text
-User taps RIGHT FRONT
-        ↓
-Microphone captures sound
-        ↓
-Tap detector identifies an impact
-        ↓
-DSP extracts features
-        ↓
-Classifier predicts RIGHT_FRONT
-        ↓
-Confidence/rejection checks pass
-        ↓
-Action engine executes "Open VS Code"
+**If no triple-tap gesture is bound, the double-tap fires immediately on the second impulse** — no
+confirm window, near-zero added latency. Only pay the 350ms wait when a longer gesture is actually
+configured. Cheap to implement, materially better feel.
+
+---
+
+## 7. Success criteria
+
+Measured, not asserted. The project succeeds when all hold on the development machine:
+
+| # | Criterion | Target |
+|---|---|---|
+| SC-1 | Detection rate on deliberate double-taps | >= 95% of 100 attempts |
+| SC-2 | **False triggers during normal desk work** | **<= 1 per hour over 4 hours** |
+| SC-3 | Latency, final tap to action fired | <= 400ms at p95 |
+| SC-4 | Gesture confusion (double read as triple, or vice versa) | <= 2% |
+| SC-5 | Runs on a second, different laptop with only threshold recalibration | works |
+| SC-6 | Idle CPU while listening | <= 2% of one core |
+| SC-7 | Automated tests cover detection, gesture assembly, and action dispatch | present and passing |
+
+**SC-2 is the make-or-break criterion.** With localization gone, tap-versus-not-tap is the entire
+product. No accuracy claim goes in the README without a measurement behind it.
+
+---
+
+## 8. Architecture
+
+```
+   Microphone (shared mode, 48kHz mono)
+        |
+        v
+   Ring buffer  ---------------------------- Phase 1
+        |
+        v
+   High-pass + absolute threshold
+        |
+        v
+   Impulse events (timestamp, level, window)
+        |
+        v
+   Tap / not-tap filter ------------------- Phase 2
+        |
+        v
+   Gesture assembler (count within window)
+        |
+        v
+   Gesture (DOUBLE | TRIPLE)
+        |
+        v
+   Action dispatcher ---------------------- Phase 3
+        |
+        v
+   Windows action
+
+   Desktop UI (system tray) --------------- Phase 4
+   SQLite config + history ---------------- Phase 5
+   Optional Node/Postgres learning layer -- Phase 6
 ```
 
----
+### 8.1 Stack
 
-## 2. Product Vision
+**Product:**
+- Python 3.13, `numpy`, `sounddevice`
+- `PySide6` for the tray application
+- `sqlite3` (standard library) for configuration and history
+- `pytest`
 
-Build a technically credible, privacy-friendly local interaction system that demonstrates how a real-world physical signal can be transformed into software behavior.
+`scipy` and `scikit-learn` are **not** dependencies until Phase 2 demonstrates that heuristics are
+insufficient. Phase 0 ran entirely on numpy.
 
-The project is intentionally designed as a major engineering project for learning and demonstrating:
+**Phase 6 (optional, learning only):** Node.js, TypeScript, Express, Prisma, PostgreSQL, Redis, JWT.
 
-- audio acquisition
-- digital signal processing
-- feature engineering
-- classification
-- calibration
-- desktop application architecture
-- REST API design
-- PostgreSQL data modeling
-- Redis usage
-- authentication and authorization
-- testing
-- Git/GitHub engineering workflow
-- system design
+### 8.2 A note on the backend
 
-The project should be understandable end-to-end by the developer. AI coding tools may be used to generate implementation code, but the developer must understand the purpose, behavior, trade-offs, interfaces, failure modes, and architecture of every major component.
+Revision 1 specified Node + Express + PostgreSQL + Redis + JWT + OpenAPI for a **single-user
+application talking to localhost**. Revision 1 §20 Rule 5 said "do not add technologies simply to
+make the project look advanced" — and then the stack section did exactly that.
 
----
+Revision 2 resolves the contradiction honestly: **SQLite is the product's persistence.** The
+Node/PostgreSQL/Redis/auth layer is retained as **Phase 6, explicitly labelled a learning
+exercise**, not a product requirement.
 
-# 3. Problem Statement
-
-Laptop users already have many ways to trigger actions: keyboard shortcuts, mouse actions, touchpads, voice assistants, and external hardware.
-
-TapSense explores another interaction method: **using the physical desk surface around the laptop as a small programmable interaction area**.
-
-The problem is not simply detecting sound. The software must distinguish an intentional desk tap from ordinary environmental noise and infer the approximate physical zone from the acoustic characteristics captured by the laptop microphone.
-
-This creates several engineering challenges:
-
-1. Continuous audio must be captured efficiently.
-2. Candidate impacts must be detected without reacting to every sound.
-3. Useful features must be extracted from short audio windows.
-4. The system must classify taps into physical zones.
-5. The classifier must be able to reject weak, ambiguous, or unfamiliar inputs.
-6. The user must calibrate the system because desks, laptops, positions, microphones, and rooms differ.
-7. Actions must execute safely and predictably.
-8. The configuration and historical evaluation data should be accessible through a local backend.
+This is the stronger position to defend. "I used SQLite because one local user does not need a
+database server, and built a REST layer separately to learn backend engineering" survives scrutiny.
+"My single-user desktop app needs JWT refresh tokens" does not.
 
 ---
 
-# 4. Goals
+## 9. Development phases
 
-## 4.1 Primary goals
-
-TapSense must:
-
-- run locally on a Windows laptop
-- use the laptop microphone as the initial sensing device
-- detect candidate desk taps
-- distinguish likely taps from non-tap audio
-- classify accepted taps into four configured zones
-- provide a calibration workflow
-- provide confidence/rejection behavior
-- let users assign actions to zones
-- execute actions locally on Windows
-- maintain local profiles and configuration
-- expose a local REST API
-- persist structured application data in PostgreSQL
-- use Redis only where it provides a real architectural benefit
-- provide automated tests for major components
-- remain explainable enough for technical interviews and project reviews
-
-## 4.2 Secondary goals
-
-- compare multiple signal-processing/classification approaches
-- measure accuracy and latency rather than claiming accuracy without evidence
-- maintain clear boundaries between audio processing, classification, actions, UI, and backend concerns
-- keep the system privacy-conscious by processing audio locally by default
-- create a repository that demonstrates professional engineering practices
+Phased, with a **measurable exit gate on every phase.** Nothing proceeds on a phase whose gate has
+not been met. This discipline is what caught the Revision 1 failure in one evening instead of month
+three.
 
 ---
 
-# 5. Non-Goals / What TapSense Is NOT
+### Phase 0 — Feasibility **[COMPLETE]**
 
-TapSense is explicitly **not** intended to be:
+**Goal:** Determine whether the sensing concept works at all before building anything.
 
-- a general-purpose smart-home system
-- a voice assistant
-- a cloud audio-analysis platform
-- a replacement for a physical keyboard or mouse
-- a security/authentication system based on tap patterns
-- a medical or safety-critical system
-- a universal guarantee for every laptop, desk, room, or microphone setup
-- an exact physical-coordinate tracker
-- a copied implementation of Holo
-- a multi-platform product in version 1
-- a deployment/cloud project during the initial build
+**Delivered:** `spike/spike.py`, `spike/FINDINGS.md`.
 
-The initial project is **local-only**. Production deployment, cloud hosting, Kubernetes, distributed deployment, and public infrastructure are outside this PRD.
+**Outcome:** Four-zone localization disproved (30.6% cross-session against an 85% gate). Hardware
+capture path characterized. Product redefined around temporal patterns.
+
+**What this phase established that the rest depends on:**
+- Cross-session evaluation is mandatory; same-session numbers lie by ~38 points
+- Shared mode is sufficient and avoids the microphone lock
+- Absolute threshold, not adaptive floor
+- Detection must run high-passed
 
 ---
 
-# 6. Target User
+### Phase 1 — Detection core
 
-### Primary user
+**Goal:** A command-line program that prints `DOUBLE TAP` / `TRIPLE TAP` reliably.
 
-A technically curious Windows laptop user who wants programmable physical desk interactions and is willing to calibrate the system for a particular desk and laptop setup.
+**Build:**
+- Shared-mode capture, 48kHz mono, ring buffer
+- High-pass, absolute-threshold onset detection, 80ms refractory
+- Gesture assembler: count impulses within the §6 timing windows
+- Threshold calibration: user taps 5 times, threshold is set from the observed levels
+- Reuse: `detect_loop`, `monitor`, and `fpr` in `spike/spike.py` are the working starting points
 
-### Development/learning user
+**Gate:**
+- SC-1 detection rate >= 95% on 100 deliberate double-taps
+- SC-2 preliminary: <= 5 false triggers per hour over 1 hour of normal work
+- SC-3 latency <= 400ms p95
 
-The project developer, who needs to understand the complete system deeply enough to explain:
-
-- why each subsystem exists
-- how data flows through it
-- what assumptions it makes
-- how it fails
-- how it is tested
-- what trade-offs were made
+**If SC-2 preliminary cannot reach 5/hour with threshold tuning alone, stop and go to Phase 2
+before building anything else.**
 
 ---
 
-# 7. Core User Experience
+### Phase 2 — Rejection quality
 
-## 7.1 First use
+**Goal:** Reach SC-2 (<= 1 false trigger/hour) and close the §3.4 unknown.
 
-```text
-Launch TapSense
-      ↓
-Create/select local device profile
-      ↓
-Configure desk/laptop setup
-      ↓
-Start calibration
-      ↓
-Tap each zone repeatedly
-      ↓
-System validates samples
-      ↓
-Train/build classifier profile
-      ↓
-Run held-out evaluation
-      ↓
-Save profile if quality is acceptable
-      ↓
-Assign actions
-      ↓
-Enter Listening/Desk mode
+**Build:**
+- Collect a labelled negative dataset: typing, mouse clicks, mug placement, drawer, door, speech,
+  music, keyboard tray knocks
+- Collect a labelled positive dataset: deliberate taps, varied force and position
+- Measure the Phase 1 heuristic against both; produce a confusion matrix
+- **Only if the heuristic misses the gate:** add features (attack time, spectral centroid, decay
+  shape, band ratios) and a binary tap/not-tap classifier. This is where `scikit-learn` earns its
+  place, if it does.
+- Test detection during an active call (§3.4)
+
+**Gate:**
+- SC-2: <= 1 false trigger/hour over 4 hours of real work
+- SC-4: <= 2% gesture confusion
+- Call behaviour characterized and documented — either it works, or TapSense pauses during calls
+
+**Evaluation rule:** train and test on data collected in **different sessions**. The Phase 0 failure
+came from ignoring exactly this.
+
+---
+
+### Phase 3 — Action engine
+
+**Goal:** Gestures do something useful.
+
+**Build:**
+- Action registry: media keys (play/pause, next, previous), launch application, open URL, run a
+  configured script, copy text
+- Validation at the configuration boundary — a configured action is a trust boundary. Script and
+  application actions must not become arbitrary command execution through unvalidated config.
+- Failure reporting: an action that fails is surfaced, not swallowed
+- Rejected gestures must be structurally incapable of reaching the dispatcher
+
+**Gate:** double-tap pauses and resumes music reliably; a deliberately malformed action
+configuration is rejected rather than executed.
+
+---
+
+### Phase 4 — Desktop application
+
+**Goal:** Something usable without a terminal.
+
+**Build:**
+- PySide6 system tray application
+- Listening on/off, current state visible
+- Threshold calibration flow
+- Action configuration per gesture
+- Live event log for debugging and trust
+- Error surfacing: microphone unavailable, device changed, action failed
+
+**Gate:** SC-6 (idle CPU <= 2% of one core). Usable for a full working day without touching a
+terminal.
+
+---
+
+### Phase 5 — Persistence
+
+**Goal:** Settings survive restart; history is queryable.
+
+**Build:**
+- SQLite schema: settings, gesture-to-action bindings, calibration values, event history
+- Migration approach for schema changes
+- History view: what fired, when, at what level — this is also the evidence trail for SC-2
+
+**Gate:** configuration survives restart; event history queryable; SC-2 re-measured from stored
+history rather than by hand.
+
+---
+
+### Phase 6 — Backend layer **[OPTIONAL — learning exercise, not a product requirement]**
+
+**Goal:** Learn backend engineering. Explicitly not required for TapSense to work.
+
+**Build:**
+- Node.js + TypeScript + Express, layered routes/controllers/services/repositories
+- PostgreSQL via Prisma; migrate the Phase 5 schema
+- Zod request validation, consistent error contracts
+- JWT authentication and authorization
+- Redis **only** where a measured benefit is shown — otherwise document the decision to omit it
+- OpenAPI documentation
+- Jest + Supertest
+
+**Gate:** the desktop application keeps working with the backend **switched off**. If it does not,
+the layering is wrong.
+
+**Framing:** present this as a deliberate learning exercise. Do not present it as necessary
+architecture for a single-user local application.
+
+---
+
+## 10. Engineering questions to be able to answer
+
+Answerable without notes, per Revision 1 §20 Rule 1.
+
+**Audio:** How does a microphone produce samples? Why does sample rate matter? Why buffer? Why does
+a high-pass filter improve tap detection when the tap is not high-frequency?
+
+**Detection:** Why absolute threshold here rather than adaptive? What is a refractory period and why
+does its length matter? What is the trade-off between detection rate and false-positive rate, and
+who chooses where to sit on it?
+
+**Gesture:** Why is single tap deliberately unusable? Why is a confirm window unavoidable when
+distinguishing double from triple, and when can it be skipped?
+
+**Evaluation:** Why did Phase 0's same-session accuracy exceed cross-session by 38 points? Why is
+false-positive rate per hour a better metric than accuracy? What makes a negative dataset good?
+
+**Architecture:** Why is the real-time loop local? Why does a single-user local app not need
+PostgreSQL? What should happen when the microphone disappears mid-session?
+
+**Physics:** Why did four-zone localization fail? What is structure-borne versus air-borne
+propagation, and why does it eliminate time-of-arrival difference? What would the hardware need to
+look like for localization to work?
+
+---
+
+## 11. Risks
+
+| Risk | Severity | Mitigation |
+|---|---|---|
+| SC-2 unreachable — false positives stay too high | **Project-ending** | Phase 2 gate. If unreachable with a classifier, require a modifier key held while tapping, or abandon. |
+| Detection fails during calls (§3.4) | Medium | Measure in Phase 2. Fallback: pause TapSense while a call application is running. |
+| Windows audio processing differs on other hardware | Medium | `spike.py devices` is the portable probe. SC-5 tests a second machine. |
+| Two gestures is too few to be useful | Low | Accepted and stated in §4.1. Evaluate quadruple-tap in Phase 2. |
+| Latency feels sluggish | Low | §6.1 optimisation removes it for the common case. |
+
+---
+
+## 12. Repository layout
+
+```
+tapsense/
+  PRD_TapSense.md          this document
+  spike/
+    spike.py               FROZEN Phase 0 artifact - produced FINDINGS.md
+    FINDINGS.md            measured hardware evidence
+    data/                  Phase 0 recordings (gitignored, ~4MB)
+  src/                     Phase 1+ product code
+  tests/                   pytest
 ```
 
-## 7.2 Normal use
-
-```text
-Microphone continuously listens
-          ↓
-Candidate audio event appears
-          ↓
-Tap detector evaluates event
-          ↓
-If rejected → ignore
-          ↓
-If accepted → extract features
-          ↓
-Classifier predicts a zone
-          ↓
-Rejection/confidence checks
-          ↓
-If uncertain → ignore/report rejection
-          ↓
-If accepted → action dispatcher
-          ↓
-Windows executes configured action
-```
-
-## 7.3 Recalibration
-
-A user can create or replace a profile when the laptop position, desk, or environment changes enough to affect classification quality.
+`spike/` is frozen evidence, not product code. Phase 1 starts fresh in `src/`. The `devices`,
+`monitor`, and `fpr` subcommands of `spike.py` remain useful as measurement tools throughout.
 
 ---
 
-# 8. High-Level System Architecture
+## 13. Immediate next step
 
-```text
-                         TAPSense SYSTEM
+**Phase 1, detection core.** Reuse `detect_loop` from `spike/spike.py`, switch it to shared mode
+with an absolute threshold, and add the gesture assembler.
 
-┌─────────────────────────────────────────────────────────────┐
-│                     Windows Desktop App                    │
-│                                                             │
-│  ┌────────────┐    ┌─────────────┐    ┌─────────────────┐  │
-│  │ Audio      │ -> │ Tap / DSP   │ -> │ Classifier      │  │
-│  │ Capture    │    │ Pipeline    │    │ + Rejection     │  │
-│  └────────────┘    └─────────────┘    └───────┬─────────┘  │
-│                                               │            │
-│                                               v            │
-│                                      ┌─────────────────┐   │
-│                                      │ Action Engine   │   │
-│                                      └─────────────────┘   │
-│                                                             │
-│                    Desktop UI / State                      │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-                               │ Local HTTP
-                               v
-                    ┌──────────────────────┐
-                    │     Local Backend    │
-                    │ Node.js + TypeScript │
-                    │       Express        │
-                    └──────────┬───────────┘
-                               │
-                 ┌─────────────┴─────────────┐
-                 v                           v
-          ┌──────────────┐            ┌──────────────┐
-          │ PostgreSQL   │            │    Redis     │
-          │ persistent   │            │ cache/state  │
-          │ application  │            │ where useful │
-          │ data         │            └──────────────┘
-          └──────────────┘
-```
-
-### Architectural principle
-
-The desktop application owns **real-time local sensing and action execution**.
-
-The backend owns **application configuration, identities, profiles, historical records, and API-level state**.
-
-The backend must not become a real-time dependency for every individual tap. Tap recognition and action triggering should continue to function locally even when the local API is unavailable, subject to the features being used.
-
----
-
-# 9. Major Components
-
-## 9.1 Audio Capture Layer
-
-Responsibilities:
-
-- open/select the microphone input
-- stream audio continuously
-- produce predictable audio buffers
-- handle start/stop lifecycle
-- detect/handle capture failures
-- expose a controlled stream to the DSP pipeline
-
-Does NOT decide which zone was tapped.
-
-## 9.2 Tap Detection Layer
-
-Responsibilities:
-
-- estimate background/noise conditions
-- detect candidate impact/onset events
-- isolate candidate time windows
-- suppress obvious non-tap events
-- enforce refractory/cooldown behavior
-
-Output:
-
-```text
-CandidateTap {
-    timestamp
-    audio_window
-    detection_metrics
-}
-```
-
-## 9.3 DSP / Feature Extraction Layer
-
-Responsibilities:
-
-- convert the short audio window into useful numerical features
-- calculate time-domain features
-- calculate frequency-domain features
-- normalize features consistently
-- expose deterministic feature vectors for training and inference
-
-Example abstraction:
-
-```text
-Audio Window
-    ↓
-Pre-processing
-    ↓
-FFT / spectral analysis
-    ↓
-Feature calculations
-    ↓
-Feature normalization
-    ↓
-Feature Vector
-```
-
-## 9.4 Classification Layer
-
-Responsibilities:
-
-- train a zone model from labeled calibration examples
-- predict one of the four zones
-- calculate confidence or decision strength
-- reject uncertain/unfamiliar input
-- expose model/version information
-
-Initial zone classes:
-
-- LEFT_FRONT
-- LEFT_REAR
-- RIGHT_FRONT
-- RIGHT_REAR
-
-Optional output:
-
-- UNKNOWN / REJECTED
-
-## 9.5 Calibration Layer
-
-Responsibilities:
-
-- guide the user through zone collection
-- collect labeled examples
-- validate sample quality
-- detect inconsistent calibration data
-- train/update a local model
-- run held-out evaluation
-- save a profile version
-
-## 9.6 Action Engine
-
-Responsibilities:
-
-- map a zone to a configured action
-- validate action configuration
-- execute supported actions safely
-- report success/failure
-- prevent actions from being triggered by rejected events
-
-Initial action categories may include:
-
-- open application
-- open URL
-- run a local command/script
-- copy configured text
-- media control
-- screenshot
-
-Exact action support will be finalized during implementation based on Windows capabilities and safe execution constraints.
-
-## 9.7 Desktop UI Layer
-
-Responsibilities:
-
-- show current listening state
-- visualize four zones
-- guide calibration
-- configure actions
-- show evaluation results
-- show diagnostics/errors
-- manage local profiles/settings
-
-## 9.8 Backend API
-
-Responsibilities:
-
-- local authentication/identity handling if enabled for the local product model
-- device/profile configuration
-- action configuration
-- calibration/evaluation metadata
-- historical records
-- API validation
-- consistent errors
-- access control
-
-## 9.9 PostgreSQL
-
-Stores durable structured application data such as:
-
-- users (if user accounts are enabled)
-- devices
-- profiles
-- zones
-- actions
-- calibration sessions
-- calibration metadata
-- evaluations
-- tap-event metadata/analytics where useful
-
-Raw audio should not be stored in PostgreSQL by default.
-
-## 9.10 Redis
-
-Redis is optional until a concrete use case exists.
-
-Potential uses:
-
-- temporary calibration state
-- cached frequently-read profiles/configuration
-- rate limiting
-- short-lived state
-
-Redis must not be included purely for resume value; each use must be justified architecturally.
-
----
-
-# 10. Technology Stack
-
-## Desktop / signal-processing side
-
-- **Python** — primary implementation language for the first Windows prototype
-- **NumPy** — numerical arrays and signal calculations
-- **SciPy** — scientific/signal-processing functionality
-- **scikit-learn** — initial classical machine-learning models
-- **sounddevice** or equivalent Windows-compatible audio input library — microphone streaming
-- **PySide6** — desktop UI
-- **pytest** — Python tests
-
-Library choices may be adjusted after validating Windows compatibility and actual project needs.
-
-## Backend
-
-- **Node.js**
-- **TypeScript**
-- **Express.js**
-- **Prisma** as the initial ORM/data-access layer
-- **PostgreSQL**
-- **Redis** where justified
-- **Zod or equivalent** for request validation
-- **Jest + Supertest** or equivalent Node testing stack
-- **OpenAPI/Swagger** for API documentation
-
-## Development tooling
-
-- Git
-- GitHub
-- VS Code
-- local PostgreSQL
-- local Redis
-- optional Docker for local environment consistency later in the project
-
-All planned software dependencies are intended to be usable without paid subscriptions. The initial system does not require paid APIs, cloud databases, commercial SDKs, or paid hosting.
-
----
-
-# 11. Data Flow
-
-## 11.1 Real-time tap path
-
-```text
-Microphone
-   ↓
-Audio buffer
-   ↓
-Noise / onset detection
-   ↓
-Candidate  tap
-   ↓
-Short analysis window
-   ↓
-Feature extraction
-   ↓
-Feature normalization
-   ↓
-Zone classifier
-   ↓
-Confidence + rejection gates
-   ↓
-Accepted zone
-   ↓
-Action lookup
-   ↓
-Action validation
-   ↓
-Windows action execution
-```
-
-## 11.2 Calibration path
-
-```text
-User selects profile
-        ↓
-Calibration starts
-        ↓
-Zone highlighted
-        ↓
-User taps
-        ↓
-Tap detection
-        ↓
-Feature extraction
-        ↓
-Sample quality validation
-        ↓
-Labeled sample stored
-        ↓
-Repeat for all zones
-        ↓
-Training
-        ↓
-Held-out evaluation
-        ↓
-Quality gate
-        ↓
-Profile/model saved
-```
-
-## 11.3 Configuration path
-
-```text
-Desktop UI
-    ↓
-Local API request
-    ↓
-Express route
-    ↓
-Validation
-    ↓
-Service layer
-    ↓
-Prisma/data access
-    ↓
-PostgreSQL
-    ↓
-Response
-    ↓
-Desktop state updated
-```
-
----
-
-# 12. Core Domain Model
-
-Initial conceptual relationships:
-
-```text
-User
-  │
-  ├───────────────┐
-  │               │
-  v               v
-Device          (optional local identity)
-  │
-  v
-Profile
-  │
-  ├──────────┬─────────────┐
-  v          v             v
-Zones      Actions     Evaluations
-  │
-  v
-Calibration Sessions
-  │
-  v
-Calibration Samples
-```
-
-A simplified relational model:
-
-```text
-users
-  |
-  | 1:N
-  v
- devices
-  |
-  | 1:N
-  v
-profiles
-  |
-  +---- 1:N ---- zones
-  |
-  +---- 1:N ---- actions
-  |
-  +---- 1:N ---- calibration_sessions
-  |                    |
-  |                    +---- 1:N ---- calibration_samples
-  |
-  +---- 1:N ---- evaluations
-```
-
-The exact schema will be designed in the PostgreSQL/data-modeling module rather than prematurely fixed in this PRD.
-
----
-
-# 13. Project Modules / Development Roadmap
-
-The project is divided into modules. Each module should produce a meaningful artifact or verified capability before moving forward.
-
----
-
-## Module 0 — Problem Definition & Engineering Design
-
-### Purpose
-
-Understand the complete problem and define the architecture before coding.
-
-### Subtopics
-
-- problem statement
-- user experience
-- functional requirements
-- non-functional requirements
-- Holo reference analysis
-- constraints
-- architecture
-- repository structure
-- module boundaries
-- success criteria
-
-### Output
-
-- requirements document
-- initial architecture diagram
-- repository structure plan
-- glossary/domain terminology
-
-### Must-understand questions
-
-- What exactly is TapSense?
-- Why does it need audio processing?
-- Why is calibration necessary?
-- Why does the system need a backend at all?
-- What belongs on the client vs backend?
-
----
-
-## Module 1 — Audio & Signal Fundamentals
-
-### Subtopics
-
-- sound as a signal
-- waveform
-- amplitude
-- frequency
-- sampling
-- sample rate
-- Nyquist concept
-- audio buffers
-- time domain
-- frequency domain
-- noise
-- SNR
-- desk resonance intuition
-
-### Output
-
-A small local experiment that records and visualizes audio.
-
----
-
-## Module 2 — Windows Audio Capture Engine
-
-### Subtopics
-
-- microphone access
-- audio stream lifecycle
-- chunks/buffers
-- sample formats
-- channels
-- device selection
-- error handling
-- start/stop
-- resource cleanup
-
-### Output
-
-Reliable microphone streaming into the application.
-
----
-
-## Module 3 — Tap Detection
-
-### Subtopics
-
-- amplitude/energy detection
-- onset detection
-- adaptive noise floor
-- thresholds
-- debounce/refractory period
-- candidate windows
-- speech rejection
-- typing/environmental noise
-- false positives
-- false negatives
-- latency
-
-### Output
-
-Reliable TAP / NOT-TAP detector with measurable behavior.
-
----
-
-## Module 4 — DSP & Feature Extraction
-
-### Subtopics
-
-- preprocessing
-- FFT
-- spectrum
-- spectral energy
-- spectral centroid
-- zero-crossing rate
-- frequency bands
-- MFCC/log-mel-style features
-- temporal features
-- normalization
-- feature vectors
-- feature visualization
-
-### Output
-
-Deterministic feature extraction pipeline.
-
----
-
-## Module 5 — Zone Classification
-
-### Subtopics
-
-- supervised classification
-- labels
-- training data
-- train/validation/test split
-- nearest-neighbor baseline
-- logistic regression
-- random forest or similar baseline
-- confidence
-- rejection
-- ambiguity
-- out-of-distribution ideas
-- confusion matrix
-- accuracy
-- precision/recall
-- latency
-
-### Output
-
-Four-zone classifier that can accept or reject a candidate tap.
-
----
-
-## Module 6 — Calibration System
-
-### Subtopics
-
-- guided calibration
-- zone sequencing
-- sample counts
-- sample quality
-- weak/noisy samples
-- retries
-- model training
-- model versioning
-- profile persistence
-- held-out evaluation
-- calibration quality gate
-- recalibration
-
-### Output
-
-Reusable calibrated profile tied to a specific laptop/desk setup.
-
----
-
-## Module 7 — Action Engine
-
-### Subtopics
-
-- action abstraction
-- action registry
-- configuration
-- Windows process execution
-- URL opening
-- applications
-- scripts
-- media actions
-- screenshots
-- validation
-- failure handling
-- safe execution
-
-### Output
-
-Zone-to-action execution pipeline.
-
----
-
-## Module 8 — Windows Desktop Application
-
-### Subtopics
-
-- desktop architecture
-- UI/state separation
-- dashboard
-- zone visualization
-- calibration UI
-- action editor
-- evaluation UI
-- settings
-- lifecycle
-- background listening
-- errors
-
-### Output
-
-Usable local Windows desktop application.
-
----
-
-## Module 9 — Backend Foundation
-
-### Subtopics
-
-- client/server reasoning
-- REST
-- HTTP request/response lifecycle
-- routing
-- controllers
-- services
-- repositories/data access
-- validation
-- error handling
-- environment configuration
-- logging
-
-### Output
-
-Clean local Node.js/TypeScript/Express backend skeleton.
-
----
-
-## Module 10 — PostgreSQL & Data Modeling
-
-### Subtopics
-
-- entities
-- relationships
-- primary keys
-- foreign keys
-- constraints
-- normalization
-- indexes
-- transactions
-- SQL
-- migrations
-- Prisma
-
-### Output
-
-Versioned local database schema and data-access layer.
-
----
-
-## Module 11 — Authentication & Authorization
-
-### Subtopics
-
-- registration
-- password hashing
-- login
-- access tokens
-- refresh tokens
-- middleware
-- authorization
-- ownership
-- logout/revocation concepts
-- security basics
-
-### Output
-
-Protected local API.
-
----
-
-## Module 12 — Profiles & Configuration APIs
-
-### Subtopics
-
-- device registration
-- profile CRUD
-- zone configuration
-- action configuration
-- active profile
-- versioning
-- validation
-- error contracts
-
-### Output
-
-Backend-managed configuration consumed by the desktop client.
-
----
-
-## Module 13 — Calibration & Evaluation APIs
-
-### Subtopics
-
-- calibration sessions
-- metadata
-- sample metadata
-- model versions
-- evaluation results
-- accuracy history
-- latency history
-- reporting
-
-### Output
-
-Historical evaluation and calibration APIs.
-
----
-
-## Module 14 — Redis & Performance
-
-### Subtopics
-
-- caching rationale
-- Redis data structures needed by the project
-- cache-aside pattern
-- TTL
-- profile/config cache
-- temporary state
-- rate limiting
-- invalidation
-- Redis failure behavior
-
-### Output
-
-Measured, justified Redis integration.
-
----
-
-## Module 15 — Client ↔ Backend Integration
-
-### Subtopics
-
-- API client
-- authentication from client
-- requests/responses
-- timeouts
-- retries
-- offline behavior
-- local fallback
-- synchronization
-- conflict handling
-
-### Output
-
-Integrated local desktop + backend system.
-
----
-
-## Module 16 — Testing & Quality
-
-### Subtopics
-
-- unit testing
-- integration testing
-- API testing
-- database tests
-- audio pipeline tests
-- classifier tests
-- calibration tests
-- action tests
-- end-to-end scenarios
-- mocking
-- fixtures
-- regression tests
-
-### Output
-
-Automated test suite covering critical behavior.
-
----
-
-## Module 17 — Security & Reliability
-
-### Subtopics
-
-- input validation
-- command execution risks
-- authorization
-- secrets
-- SQL injection concepts
-- rate limiting
-- error leakage
-- resource exhaustion
-- crash recovery
-- privacy
-- failure modes
-
-### Output
-
-Security/reliability review and fixes.
-
----
-
-## Module 18 — Final Local Integration
-
-### Subtopics
-
-- complete local startup flow
-- client + backend + PostgreSQL + Redis
-- configuration
-- local environment setup
-- data reset/recovery
-- final integration tests
-- performance measurement
-- profiling
-
-### Output
-
-A complete reproducible local system.
-
-**Important:** Deployment/cloud hosting is intentionally excluded from this PRD. Deployment concepts may be taught separately after the project is complete.
-
----
-
-# 14. Local-Only Architecture Constraint
-
-During the initial project, all core infrastructure runs locally.
-
-```text
-┌─────────────────────────────────────────────┐
-│                YOUR WINDOWS PC              │
-│                                             │
-│  ┌─────────────┐     ┌──────────────────┐  │
-│  │ TapSense UI │────▶│ TapSense Client  │  │
-│  └─────────────┘     └─────────┬────────┘  │
-│                                │            │
-│                                │ localhost  │
-│                                v            │
-│                    ┌─────────────────────┐  │
-│                    │ Local Node Backend  │  │
-│                    └───────┬──────┬──────┘  │
-│                            │      │          │
-│                            v      v          │
-│                      PostgreSQL  Redis       │
-│                                             │
-└─────────────────────────────────────────────┘
-```
-
-No cloud dependency is required for the initial product.
-
----
-
-# 15. Initial API Surface (Conceptual)
-
-The API will be finalized after the database/domain model is designed.
-
-Possible endpoint groups:
-
-```text
-/api/auth
-/api/devices
-/api/profiles
-/api/profiles/:profileId/zones
-/api/profiles/:profileId/actions
-/api/profiles/:profileId/calibration
-/api/profiles/:profileId/evaluations
-/api/events
-```
-
-Example operations:
-
-```text
-POST   /api/auth/register
-POST   /api/auth/login
-
-POST   /api/devices
-GET    /api/devices
-
-POST   /api/profiles
-GET    /api/profiles
-GET    /api/profiles/:id
-PUT    /api/profiles/:id
-DELETE /api/profiles/:id
-
-GET    /api/profiles/:id/zones
-PUT    /api/profiles/:id/zones/:zoneId
-
-POST   /api/profiles/:id/calibration
-POST   /api/profiles/:id/evaluations
-GET    /api/profiles/:id/evaluations
-```
-
-These are design candidates, not final contracts.
-
----
-
-# 16. Functional Requirements
-
-## FR-01 Audio capture
-
-The system shall capture microphone audio continuously during listening mode.
-
-## FR-02 Tap detection
-
-The system shall identify candidate tap events from the live audio stream.
-
-## FR-03 Rejection of non-taps
-
-The system shall reject obvious sustained/noisy events when they do not match the expected tap characteristics.
-
-## FR-04 Feature extraction
-
-The system shall convert accepted candidate windows into deterministic feature vectors.
-
-## FR-05 Zone classification
-
-The system shall classify a candidate into one of four configured zones or reject it.
-
-## FR-06 Calibration
-
-The system shall guide the user through a zone calibration process.
-
-## FR-07 Evaluation
-
-The system shall support held-out evaluation and report meaningful quality metrics.
-
-## FR-08 Profiles
-
-The system shall support saved local configuration/model profiles.
-
-## FR-09 Action mapping
-
-The system shall map each zone to a configured action.
-
-## FR-10 Action execution
-
-The system shall execute valid configured actions locally.
-
-## FR-11 Local API
-
-The system shall expose a local REST API for configuration and historical data.
-
-## FR-12 Persistence
-
-The system shall persist structured application data locally in PostgreSQL.
-
-## FR-13 Optional caching/state
-
-The system may use Redis for justified temporary state or caching.
-
-## FR-14 Testing
-
-Critical components shall have automated tests.
-
----
-
-# 17. Non-Functional Requirements
-
-## NFR-01 Local processing
-
-Raw audio processing for tap detection and classification should occur locally by default.
-
-## NFR-02 Privacy
-
-Raw audio shall not leave the local machine as part of normal operation.
-
-## NFR-03 Latency
-
-The interaction should feel near-instantaneous. A concrete latency target will be established empirically during implementation and benchmarking.
-
-## NFR-04 Resource usage
-
-The application should avoid unnecessary CPU and memory consumption during idle listening.
-
-## NFR-05 Reliability
-
-The application should fail safely when the microphone becomes unavailable, the classifier rejects input, an action fails, or the backend is unavailable.
-
-## NFR-06 Explainability
-
-The system's major decisions and data flow must be explainable to a technically knowledgeable reviewer.
-
-## NFR-07 Maintainability
-
-The codebase should maintain clear module boundaries and automated verification.
-
----
-
-# 18. Success Criteria
-
-TapSense is considered a successful project when all of the following are true:
-
-1. A Windows laptop can capture audio locally.
-2. The system can detect intentionally produced taps with useful reliability.
-3. The system can extract repeatable features from candidate taps.
-4. A calibrated model can distinguish the four configured zones with measurable accuracy.
-5. The system can reject at least some common non-tap/ambiguous inputs.
-6. A user can configure actions for each zone.
-7. Accepted taps trigger only their intended actions.
-8. Calibration/evaluation data can be persisted and retrieved.
-9. The desktop client can communicate with the local backend.
-10. PostgreSQL stores structured persistent data.
-11. Redis is either meaningfully used or intentionally omitted after evaluation.
-12. Automated tests cover critical functionality.
-13. The complete local system can be explained end-to-end by the developer.
-
-Accuracy is not to be claimed without real measured evaluation on the tested laptop/desk setup.
-
----
-
-# 19. Key Engineering Questions We Must Answer
-
-Throughout the project, we should be able to answer these questions without relying on generated code or memorized definitions:
-
-### Audio
-
-- How does a microphone convert sound into samples?
-- Why does sample rate matter?
-- Why are audio buffers necessary?
-- What does the raw waveform tell us?
-
-### DSP
-
-- Why do we use the FFT?
-- What is the difference between time-domain and frequency-domain information?
-- Why do different desk zones produce different feature patterns?
-- Why normalize features?
-
-### Classification
-
-- Why is this a supervised classification problem?
-- Why start with a simple classifier?
-- What is confidence?
-- What does rejection mean?
-- Why can high calibration accuracy still produce poor real-world performance?
-
-### Calibration
-
-- Why is one model/profile not necessarily valid on every desk?
-- Why do we need held-out evaluation?
-- What makes a training sample weak or noisy?
-
-### Actions
-
-- How do we safely execute local actions?
-- How do we prevent rejected taps from triggering actions?
-- What happens when an action fails?
-
-### Backend
-
-- Why does the client need an API?
-- Which state belongs in PostgreSQL?
-- What should never be stored in the database?
-- Why would Redis help here?
-- What should happen when the backend is unavailable?
-
-### Architecture
-
-- Why is the real-time tap loop local?
-- Why should the backend not sit in the critical path for every tap?
-- What are the boundaries between client, backend, and database?
-
----
-
-# 20. Development Philosophy
-
-TapSense will be built using the following rules:
-
-### Rule 1 — Understand before implementation
-
-Before coding a major subsystem, first understand the problem, inputs, outputs, architecture, and trade-offs.
-
-### Rule 2 — AI may write code; the developer owns understanding
-
-AI coding tools may be used to generate boilerplate, implementations, tests, refactors, and documentation. Generated code must be reviewed and understood before being accepted.
-
-### Rule 3 — Build incrementally
-
-Do not build the whole system in one pass. Each module should leave a working artifact.
-
-### Rule 4 — Measure instead of assuming
-
-Audio classification quality, latency, false positives, and resource usage must be measured experimentally.
-
-### Rule 5 — Keep the architecture honest
-
-Do not add technologies simply to make the project look advanced. Every component must solve an actual problem.
-
-### Rule 6 — Prefer simple baselines first
-
-Start with understandable approaches and introduce complexity only when evidence shows that it is needed.
-
-### Rule 7 — Document decisions
-
-Important architecture and implementation decisions should explain what was chosen, why it was chosen, and what alternatives were rejected.
-
----
-
-# 21. Reference to Holo
-
-Holo is used only as a **conceptual/reference project**.
-
-We may study its:
-
-- problem framing
-- calibration concepts
-- signal-processing ideas
-- four-zone interaction model
-- rejection/evaluation concepts
-- architecture/documentation practices
-
-We will independently implement TapSense for Windows and will not copy source code, proprietary assets, or undocumented implementation details.
-
----
-
-# 22. Project Boundaries for Version 1
-
-Version 1 will focus on:
-
-```text
-Windows laptop
-      +
-laptop microphone
-      +
-four desk zones
-      +
-local signal processing
-      +
-local classifier
-      +
-local actions
-      +
-local desktop UI
-      +
-local REST backend
-      +
-local PostgreSQL
-      +
-optional local Redis
-```
-
-Version 1 will not focus on:
-
-```text
-Cloud hosting
-Public deployment
-Kubernetes
-Multi-region systems
-Mobile apps
-macOS implementation
-Linux implementation
-Specialized hardware
-Large neural networks
-Commercial APIs
-```
-
----
-
-# 23. Final System Picture
-
-```text
-                     TAPSense
-
-       ┌────────────────────────────────┐
-       │         Physical World         │
-       │                                │
-       │   User taps one desk zone      │
-       └────────────────┬───────────────┘
-                        │
-                        v
-       ┌────────────────────────────────┐
-       │        Windows Laptop          │
-       │                                │
-       │  Microphone                    │
-       │      ↓                         │
-       │  Tap Detection                 │
-       │      ↓                         │
-       │  DSP / Feature Extraction      │
-       │      ↓                         │
-       │  Zone Classifier               │
-       │      ↓                         │
-       │  Confidence / Rejection        │
-       │      ↓                         │
-       │  Action Engine                 │
-       └────────────────┬───────────────┘
-                        │
-                        │ local HTTP
-                        v
-       ┌────────────────────────────────┐
-       │       Local Backend API        │
-       │                                │
-       │ Node.js + TypeScript + Express │
-       └───────────────┬────────────────┘
-                       │
-               ┌───────┴────────┐
-               v                v
-       ┌──────────────┐  ┌──────────────┐
-       │ PostgreSQL   │  │    Redis     │
-       │ durable data │  │ cache/state  │
-       └──────────────┘  └──────────────┘
-```
-
----
-
-# 24. Immediate Next Step
-
-The project will begin with **Module 0**.
-
-The first learning topic is:
-
-> **Module 0.1 — What problem are we actually solving, and why is it technically difficult?**
-
-Before implementation, we will establish:
-
-- the exact user problem
-- the core requirements
-- the important assumptions
-- the system boundaries
-- the terminology used throughout the project
-- the first architecture decisions
-
-No deployment work is part of the current PRD.
+First deliverable: a terminal window that prints `DOUBLE TAP` when you double-tap the desk, and
+prints nothing at all when you work normally for an hour.
