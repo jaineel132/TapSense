@@ -1,2 +1,3 @@
 spike/data/
 __pycache__/
+src/config.json

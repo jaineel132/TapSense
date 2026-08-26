@@ -67,10 +67,29 @@ Nothing else — no window, no buttons, no actions, no saved data.
 It doesn't matter what your tap sounded like — it matters that there were two of them, close
 together, on purpose. Rhythm is far harder to trigger by accident than sound.
 
-**Done when:**
-- It catches nearly every deliberate double-tap
-- It stays quiet while you work normally
-- It reacts fast enough to feel responsive
+**Working so far:** double-taps and triple-taps are detected. Single taps are ignored.
+
+**Two real bugs we hit and fixed — worth knowing, they're good things to be able to explain:**
+
+1. **A tap rings.** Like hitting a bell, the sound keeps going for about a tenth of a
+   second after your knuckle lands. The first version counted *every* loud moment, so one
+   tap looked like several — a single tap came out as a double-tap. Fixed by triggering on
+   the *start* of a sound and refusing to listen again until it has actually died away.
+
+2. **Ringing wobbles.** It doesn't fade smoothly — it dips quiet for an instant and comes
+   back. So the fix above still re-triggered on the bounce. Fixed by requiring a sustained
+   stretch of quiet before listening again. *This one was caught by an automated test built
+   from a real recorded tap, not by hand.*
+
+3. **Calibration was fooled by its own echoes.** When learning how loud your taps are, it
+   also picked up faint ring fragments and treated them as taps. Because it used the
+   *quietest* reading, the junk dragged the setting far too low, and then echoes started
+   registering as extra taps. Fixed by using the *middle* reading instead — junk is always
+   the quietest, so the middle value lands on a genuine tap.
+
+**Still to do before this phase is genuinely finished:**
+- Run it for an hour of normal work and count how often it fires when it shouldn't
+- Confirm it catches double-taps reliably, not just sometimes
 
 **Files:** `src/tapsense.py`
 
