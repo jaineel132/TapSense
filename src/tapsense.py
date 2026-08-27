@@ -134,6 +134,63 @@ def impulses(stream, threshold, on_impulse, stop_when, on_tick=None, on_event_en
             on_tick(now)
 
 
+def events(stream, threshold, on_event, stop_when):
+    """Like impulses(), but hands back the actual audio of each sound.
+
+    Keeps a rolling buffer so the window can start slightly BEFORE the trigger --
+    the sharp leading edge is the most distinctive part, and it has already gone past
+    by the time the level crosses the threshold.
+    """
+    pre, post = int(SR * 0.005), int(SR * 0.100)
+    ring = np.zeros(pre + post + BLOCK * 2, np.float32)
+    trig = Trigger(threshold)
+    pending = None
+
+    while not stop_when():
+        block, _ = stream.read(BLOCK)
+        now = time.monotonic()
+        ring = np.concatenate([ring[len(block):], block[:, 0]])
+        if trig.update(now, level_of(block)):
+            pending = 0
+        elif pending is not None:
+            pending += BLOCK
+            if pending >= post:
+                start = len(ring) - pending - pre - BLOCK
+                on_event(trig.peak, ring[start:start + pre + post].copy())
+                pending = None
+
+
+def shape_features(win):
+    """Numbers describing the SHAPE of a sound, independent of how loud it is.
+
+    Everything here is a ratio or a duration, so a hard tap and a soft tap look alike
+    while a tap and a drum hit do not.
+    """
+    w = win.astype(np.float64)
+    w = w - w.mean()
+    env = np.abs(w)
+    pk = env.max() + 1e-12
+    spec = np.abs(np.fft.rfft(w * np.hanning(len(w)))) ** 2
+    freq = np.fft.rfftfreq(len(w), 1 / SR)
+
+    def band(lo, hi):
+        return spec[(freq >= lo) & (freq < hi)].sum() + 1e-20
+
+    peak_at = int(np.argmax(env))
+    above = np.where(env > pk * 0.5)[0]
+    return {
+        # Laptop speakers physically cannot push low frequencies; a knuckle thumps
+        # them straight into the desk and chassis. This is the main hypothesis.
+        "low_vs_high": np.log10(band(80, 500) / band(2000, 12000)),
+        "low_share": np.log10(band(80, 500) / spec.sum()),
+        # A struck desk transfers energy almost instantly; a speaker cone cannot.
+        "attack_ms": 1000.0 * peak_at / SR,
+        "width_ms": 1000.0 * len(above) / SR,
+        "centroid": np.log10((spec * freq).sum() / (spec.sum() + 1e-20) + 1),
+        "crest": np.log10(pk / (np.sqrt((w ** 2).mean()) + 1e-12)),
+    }
+
+
 # ---------------------------------------------------------------- gestures
 
 class Gestures:
@@ -267,18 +324,29 @@ def cmd_calibrate(a):
     Guessing either one is how the first version got a threshold that missed taps.
     """
     with open_stream(a.device) as s:
-        # Step 1 -- what does this desk sound like when nothing happens?
-        print("\n  Step 1 of 2: sit still and stay quiet for 3 seconds...\n")
+        # Step 1 -- what does this desk sound like when you are NOT tapping?
+        #
+        # Music through laptop speakers feeds back into the mic, and drum hits look
+        # very like taps. Measured on this machine, speaker feedback reached 1.6e-5
+        # while a real tap peaks around 2.4e-4. If music is playing during this step
+        # its level lands in the background measurement, and the threshold rises above
+        # it automatically -- self-calibrating to whatever volume you actually use.
+        print("\n  Step 1 of 2: don't tap for 3 seconds.")
+        print("  If you listen through SPEAKERS, start your music now at your usual volume.")
+        print("  (that way the threshold learns to ignore it)\n")
+        time.sleep(1.0)
         bg = []
         t_end = time.monotonic() + 3.0
         while time.monotonic() < t_end:
             bg.append(level_of(s.read(BLOCK)[0]))
-        noise = float(np.percentile(bg, 99))
-        print("   background noise: {:.1e}".format(noise))
+        # 99.9th percentile, not 99th. Interference from music is IMPULSIVE -- a drum
+        # hit occupies two or three blocks out of hundreds, so an ordinary percentile
+        # steps right over it and reports a floor far below what actually triggers.
+        # We need to sit above the loudest non-tap thing, not the typical one.
+        noise = float(np.percentile(bg, 99.9))
+        print("   background: {:.1e}  (loudest non-tap sound)".format(noise))
 
-        # Threshold well clear of the noise. Taps measured on this hardware run
-        # 10-100x above background, so 4x leaves room for gentler taps.
-        threshold = max(noise * 4, MIN_LEVEL)
+        threshold = max(noise * 2, MIN_LEVEL)
 
         # Step 2 -- how strong is an actual tap? Uses the full event strength
         # (its peak), not the first block, which is only a fraction of the way up.
@@ -303,9 +371,13 @@ def cmd_calibrate(a):
     # which is exactly how it ended up pinned to the floor and counting echoes as taps.
     typical = float(np.median(peaks))
 
-    # A tap's first moment is only a few percent of its peak (the sound ramps up),
-    # so the threshold has to sit well under the peak to catch the onset at all.
-    threshold = max(typical * 0.05, noise * 4, MIN_LEVEL)
+    # 0.15, not the 0.05 this started at. 0.05 sat below speaker feedback from music,
+    # so a drum beat landed as an extra impulse and turned a double-tap into a triple
+    # -- which fired "next track" instead of "pause". Raising it does not lose taps:
+    # the trigger fires on the way UP through the threshold, so a louder bar just
+    # fires a few milliseconds later. It only drops taps whose whole peak is quieter
+    # than 15% of a normal one.
+    threshold = max(typical * 0.15, noise * 2, MIN_LEVEL)
 
     CONFIG.write_text(json.dumps({"threshold": threshold, "noise": noise,
                                   "typical_tap": typical}, indent=2))
@@ -313,9 +385,15 @@ def cmd_calibrate(a):
     print("  typical tap  {:.1e}".format(typical))
     print("  threshold    {:.1e}   <- saved".format(threshold))
     print("\n  Your typical tap is {:.0f}x above the threshold.".format(typical / threshold))
-    if typical / threshold < 5:
+    if typical / threshold < 4:
         print("  That is tight -- gentle taps may be missed and noise may slip through.")
-        print("  Tapping a little harder, or on a harder part of the desk, will help.")
+        if noise * 2 >= typical * 0.15:
+            print("\n  Your background is loud compared to your taps.")
+            print("  If that was music through SPEAKERS: the mic hears it and drum hits")
+            print("  look like taps, which turns a double-tap into a triple-tap.")
+            print("  HEADPHONES fix this completely -- the mic then hears only you.")
+        else:
+            print("  Tap harder, or on a firmer part of the desk.")
     else:
         print("  Good margin.")
     print("\n  Now run:  python src/tapsense.py listen")
@@ -446,6 +524,84 @@ def cmd_debug(a):
             pk.min() / max(np.percentile(bg, 99), 1e-12)))
     print("\n  One line per tap = detection is working.")
     print("  Several lines from one tap = it is still double-counting; tell me.\n")
+
+
+SAMPLES = Path(__file__).parent / "samples"
+
+
+def cmd_collect(a):
+    """Record the sound of each detected event, labelled, so we can compare them."""
+    SAMPLES.mkdir(exist_ok=True)
+    thr = a.threshold or load_threshold() or MIN_LEVEL
+    got = []
+    if a.label == "tap":
+        print("\n  Recording YOUR TAPS. Music OFF, headphones off, room quiet.")
+        print("  Tap the desk {} times, normally, about a second apart.\n".format(a.n))
+    else:
+        print("\n  Recording FALSE TRIGGERS. Start your music on SPEAKERS now.")
+        print("  Do NOT tap. Just let it play until it has caught {}.\n".format(a.n))
+
+    with open_stream(a.device) as s:
+        try:
+            events(s, thr,
+                   lambda pk, win: (got.append(win),
+                                    print("   {} {}/{}   strength {:.1e}".format(
+                                        a.label, len(got), a.n, pk))),
+                   lambda: len(got) >= a.n)
+        except KeyboardInterrupt:
+            print("\n  stopped early")
+
+    if not got:
+        print("\n  Caught nothing. Lower the threshold with --threshold, or tap harder.")
+        return 1
+    path = SAMPLES / "{}.npz".format(a.label)
+    old = list(np.load(path)["w"]) if path.exists() else []
+    np.savez_compressed(path, w=np.array(old + got, np.float32))
+    print("\n  saved {} -> {}  (total {})".format(len(got), path.name, len(old) + len(got)))
+
+
+def cmd_analyze(a):
+    """Find which shape feature best separates real taps from speaker feedback."""
+    sets = {}
+    for label in ("tap", "noise"):
+        p = SAMPLES / "{}.npz".format(label)
+        if not p.exists():
+            print("\n  Missing {}. Run:  python src/tapsense.py collect --label {}".format(
+                p.name, label))
+            return 1
+        sets[label] = np.load(p)["w"]
+    print("\n  {} taps, {} false triggers\n".format(len(sets["tap"]), len(sets["noise"])))
+
+    feats = {k: [shape_features(w)[k] for w in sets[k2]]
+             for k2 in sets for k in shape_features(sets[k2][0])}
+    tapf = [shape_features(w) for w in sets["tap"]]
+    noif = [shape_features(w) for w in sets["noise"]]
+
+    print("  {:<14} {:>10} {:>10}   {:>9}".format("feature", "taps", "music", "separates"))
+    best = []
+    for k in tapf[0]:
+        t = np.array([f[k] for f in tapf])
+        n = np.array([f[k] for f in noif])
+        # Best single cut-off between the two groups, and how often it is right.
+        cuts = np.unique(np.concatenate([t, n]))
+        acc, cut, sign = 0, 0, 1
+        for c in cuts:
+            for sg in (1, -1):
+                a_ = (np.mean(sg * t >= sg * c) + np.mean(sg * n < sg * c)) / 2
+                if a_ > acc:
+                    acc, cut, sign = a_, c, sg
+        best.append((acc, k, cut, sign))
+        print("  {:<14} {:>10.2f} {:>10.2f}   {:>8.0%}".format(k, t.mean(), n.mean(), acc))
+
+    best.sort(reverse=True)
+    acc, k, cut, sign = best[0]
+    print("\n  Best separator: {}  ({:.0%} correct)".format(k, acc))
+    print("  Rule: a real tap has {} {} {:.3f}".format(k, ">=" if sign > 0 else "<=", cut))
+    if acc < 0.85:
+        print("\n  Under 85% -- not reliable enough to act on alone.")
+        print("  Collect more samples, or headphones remain the practical answer.")
+    else:
+        print("\n  Good enough to use. Tell me and I will wire it into the detector.")
 
 
 def cmd_actions(a):
@@ -590,6 +746,15 @@ def main():
     d.add_argument("--device", type=int, default=None)
     d.add_argument("--threshold", type=float, default=None)
     d.set_defaults(f=cmd_debug)
+
+    co = sub.add_parser("collect", help="record labelled sounds for comparison")
+    co.add_argument("--label", required=True, choices=["tap", "noise"])
+    co.add_argument("--n", type=int, default=25)
+    co.add_argument("--device", type=int, default=None)
+    co.add_argument("--threshold", type=float, default=None)
+    co.set_defaults(f=cmd_collect)
+
+    sub.add_parser("analyze", help="find what separates taps from music").set_defaults(f=cmd_analyze)
 
     ac = sub.add_parser("actions", help="show configured actions and test one")
     ac.add_argument("--run", metavar="GESTURE", default=None,

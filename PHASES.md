@@ -106,6 +106,11 @@ talking, music) and a measurement of how often TapSense wrongly thinks that was 
 If it misfires too often, we teach it the difference between a real tap and desk noise properly,
 using examples of both.
 
+**Scope: a normal quiet desk. No music playing.** Music through speakers is a real problem but a
+separate one — it gets its own phase later. Get the ordinary case solid first.
+
+So this phase only cares about: typing, mouse clicks, mugs, drawers, doors, chairs, talking.
+
 **Also settles one open question:** during a video call, someone is talking constantly, so the
 microphone is never silent. We don't yet know how tap detection behaves then.
 
@@ -147,7 +152,33 @@ what fired and when.
 
 ---
 
-## Phase 6 — Backend layer · NOT STARTED · *optional*
+## Phase 6 — Work while music is playing · NOT STARTED
+
+**Deliberately deferred.** Everything before this assumes a quiet desk. This phase widens it.
+
+**The problem, already measured:** music through **laptop speakers feeds back into the
+microphone**, and a drum hit looks almost exactly like a tap. A double-tap plus one stray beat
+becomes three impulses — which fires the triple-tap action instead of the double-tap one. That is
+why "pause my music" sometimes skipped to the next song: it was reading `TRIPLE TAP` = next track.
+
+Speaker feedback peaked at `8.9e-5`, a real tap at `2.4e-4` — only **2.7x apart**, and they
+overlap. Raising the threshold cut it down but never eliminated it. **Loudness cannot separate
+them.**
+
+**The idea to test when we get here:** stop asking "how loud was it" and ask "**what shape was
+it**". Laptop speakers are tiny and physically cannot push low frequencies. A knuckle thumps low
+energy straight into the desk and the laptop chassis, and the microphone sits inside that chassis.
+So a real tap should carry deep frequencies that a played drum simply cannot.
+
+**Already built and waiting** (unused until this phase):
+- `collect --label tap` / `--label noise` — records labelled examples of each
+- `analyze` — measures six shape properties and reports which separates them best
+
+**Practical answer until then:** headphones. The microphone then hears only you.
+
+---
+
+## Phase 7 — Backend layer · NOT STARTED · *optional*
 
 **Not needed for TapSense to work.** This phase exists to learn backend engineering: a web API,
 a proper database server, login and accounts.
