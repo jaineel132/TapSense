@@ -67,6 +67,31 @@ def level_of(block):
     return float(np.sqrt((np.diff(block[:, 0].astype(np.float64)) ** 2).mean()))
 
 
+TYPING_GUARD_MS = 250       # ignore impulses this soon after a key press or mouse action
+
+
+def ms_since_input():
+    """Milliseconds since the user last pressed a key or moved/clicked the mouse.
+
+    The keyboard is bolted to the same chassis as the microphone, so a keystroke and
+    a desk tap are almost the same physical event -- measured at ~50 false impulses
+    per minute while typing normally. No amount of threshold tuning separates them.
+
+    But a deliberate desk tap involves no keyboard and no mouse. So if Windows says
+    you touched an input device a few milliseconds ago, that impulse was your typing,
+    not your knuckle. Costs 1.4 microseconds per call.
+    """
+    import ctypes
+
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+    li = LASTINPUTINFO()
+    li.cbSize = ctypes.sizeof(li)
+    ctypes.windll.user32.GetLastInputInfo(ctypes.byref(li))
+    return ctypes.windll.kernel32.GetTickCount() - li.dwTime
+
+
 class Trigger:
     """Fires once per sound event, at the moment it starts.
 
@@ -117,8 +142,14 @@ class Trigger:
         return False
 
 
-def impulses(stream, threshold, on_impulse, stop_when, on_tick=None, on_event_end=None):
-    """Call on_impulse(time, level) once per tap, at the instant it starts."""
+def impulses(stream, threshold, on_impulse, stop_when, on_tick=None, on_event_end=None,
+             guard_typing=True, on_suppressed=None):
+    """Call on_impulse(time, level) once per tap, at the instant it starts.
+
+    Impulses arriving right after keyboard or mouse activity are dropped -- see
+    ms_since_input(). Disable with guard_typing=False (calibration does, since you
+    press Enter to start it and the first tap would otherwise be swallowed).
+    """
     trig = Trigger(threshold)
     was_armed = True
     while not stop_when():
@@ -126,7 +157,11 @@ def impulses(stream, threshold, on_impulse, stop_when, on_tick=None, on_event_en
         now = time.monotonic()
         lvl = level_of(block)
         if trig.update(now, lvl):
-            on_impulse(now, lvl)
+            if guard_typing and ms_since_input() < TYPING_GUARD_MS:
+                if on_suppressed:
+                    on_suppressed(now, lvl)
+            else:
+                on_impulse(now, lvl)
         if on_event_end and trig.armed and not was_armed:
             on_event_end(trig.onset_t, trig.peak)   # full strength, known only at the end
         was_armed = trig.armed
@@ -354,6 +389,7 @@ def cmd_calibrate(a):
         peaks = []
         try:
             impulses(s, threshold, lambda t, lvl: None, lambda: len(peaks) >= 5,
+                     guard_typing=False,
                      on_event_end=lambda t, pk: (peaks.append(pk),
                                                  print("   tap {}/5   strength {:.1e}".format(len(peaks), pk))))
         except KeyboardInterrupt:
@@ -426,7 +462,7 @@ def cmd_listen(a):
         print("  Add --verbose to see every sound it hears.")
     print()
 
-    stats = {"impulses": 0, "gestures": 0, "ignored": 0}
+    stats = {"impulses": 0, "gestures": 0, "ignored": 0, "typing": 0}
 
     def fired(name, count):
         if name:
@@ -451,17 +487,23 @@ def cmd_listen(a):
         if a.verbose:
             print("   .   tap heard, strength {:.1e}".format(lvl))
 
+    def suppressed(t, lvl):
+        stats["typing"] += 1
+        if a.verbose:
+            print("   x   suppressed (you were typing), strength {:.1e}".format(lvl))
+
     g = Gestures(fired)
     started = time.monotonic()
     with open_stream(a.device) as s:
         try:
             impulses(s, threshold, lambda t, lvl: (saw(t, lvl), g.impulse(t, lvl)),
-                     lambda: False, on_tick=g.tick)
+                     lambda: False, on_tick=g.tick, on_suppressed=suppressed)
         except KeyboardInterrupt:
             hours = (time.monotonic() - started) / 3600
             print("\n  ran {:.1f} min".format(hours * 60))
             print("  {} taps heard -> {} gestures, {} ignored".format(
                 stats["impulses"], stats["gestures"], stats["ignored"]))
+            print("  {} suppressed as keyboard/mouse noise".format(stats["typing"]))
             print("  Ignored ones are single taps and stray noise, thrown away on purpose.")
             if hours > 0:
                 # The Phase 1 / Phase 2 gate: if you did NOT tap during this run,
