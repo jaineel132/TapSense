@@ -172,10 +172,89 @@ class Gestures:
 
 # ---------------------------------------------------------------- config
 
+def load_config():
+    return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+
+
 def load_threshold():
-    if CONFIG.exists():
-        return json.loads(CONFIG.read_text())["threshold"]
-    return None
+    return load_config().get("threshold")
+
+
+DEFAULT_ACTIONS = {
+    "DOUBLE TAP": {"do": "media", "key": "play_pause"},
+    "TRIPLE TAP": {"do": "media", "key": "next"},
+}
+
+
+# ---------------------------------------------------------------- actions
+
+# Windows virtual key codes for the media keys every music player already listens to.
+# Using these instead of talking to Spotify/VLC/YouTube directly means one code path
+# controls whatever is playing, with no per-app integration and no extra dependency.
+MEDIA_KEYS = {
+    "play_pause": 0xB3,
+    "next": 0xB0,
+    "prev": 0xB1,
+    "mute": 0xAD,
+    "volume_up": 0xAF,
+    "volume_down": 0xAE,
+}
+
+
+def press_media_key(vk):
+    import ctypes
+    ctypes.windll.user32.keybd_event(vk, 0, 0, 0)   # key down
+    ctypes.windll.user32.keybd_event(vk, 0, 2, 0)   # key up
+
+
+def resolve(spec):
+    """Validate one action from the config file. Returns (description, run).
+
+    Raises ValueError on anything malformed. Config is a trust boundary -- it decides
+    what gets launched -- so it is checked before anything runs, never while running.
+    Nothing here is eval'd or shelled out as a string.
+    """
+    if not isinstance(spec, dict) or "do" not in spec:
+        raise ValueError("action must be an object with a 'do' field")
+
+    kind = spec["do"]
+
+    if kind == "media":
+        key = spec.get("key")
+        if key not in MEDIA_KEYS:
+            raise ValueError("unknown media key {!r}; choose from: {}".format(
+                key, ", ".join(sorted(MEDIA_KEYS))))
+        return "media key: " + key, lambda: press_media_key(MEDIA_KEYS[key])
+
+    if kind == "url":
+        target = spec.get("target", "")
+        if not isinstance(target, str) or not target.startswith(("http://", "https://")):
+            raise ValueError("url target must start with http:// or https://")
+        import webbrowser
+        return "open url: " + target, lambda: webbrowser.open(target)
+
+    if kind == "open":
+        target = spec.get("target", "")
+        if not isinstance(target, str) or not target:
+            raise ValueError("open target must be a path to a file or application")
+        if not Path(target).exists():
+            raise ValueError("open target does not exist: " + target)
+        import os
+        return "open: " + target, lambda: os.startfile(target)
+
+    raise ValueError("unknown action type {!r}; choose from: media, url, open".format(kind))
+
+
+def load_actions():
+    """Validate every configured action up front, so a typo fails now, not mid-gesture."""
+    configured = load_config().get("actions", DEFAULT_ACTIONS)
+    out, errors = {}, []
+    for gesture, spec in configured.items():
+        try:
+            out[gesture] = resolve(spec)
+        except ValueError as e:
+            errors.append("  {}: {}".format(gesture, e))
+    return out, errors
 
 
 # ---------------------------------------------------------------- commands
@@ -249,8 +328,22 @@ def cmd_listen(a):
         print("    python src/tapsense.py calibrate\n")
         return 1
 
+    actions, errors = load_actions()
+    if errors:
+        # Refuse to run with a broken config rather than silently skipping actions.
+        print("\n  Bad action configuration in {}:".format(CONFIG.name))
+        print("\n".join(errors))
+        print("\n  Fix it, or delete the 'actions' section to fall back to defaults.\n")
+        return 1
+
     print("\n  Listening. Double-tap or triple-tap the desk. Ctrl+C to stop.")
     print("  (single taps are ignored on purpose)")
+    if a.act:
+        print("\n  ACTIONS ARMED:")
+        for gesture, (what, _) in sorted(actions.items()):
+            print("    {:<12} -> {}".format(gesture, what))
+    else:
+        print("  Actions are NOT armed -- gestures only print. Add --act to run them.")
     if not a.verbose:
         print("  Add --verbose to see every sound it hears.")
     print()
@@ -263,6 +356,13 @@ def cmd_listen(a):
             # Clock time, so an hour-long unattended run can be read back afterwards
             # and lined up against what you were doing when it fired.
             print("   {}   >>> {}".format(time.strftime("%H:%M:%S"), name))
+            if a.act and name in actions:
+                what, run = actions[name]
+                try:
+                    run()
+                except Exception as e:
+                    # A failing action must never take the listener down with it.
+                    print("       action failed ({}): {}".format(what, e))
         else:
             stats["ignored"] += 1
             if a.verbose:
@@ -348,6 +448,35 @@ def cmd_debug(a):
     print("  Several lines from one tap = it is still double-counting; tell me.\n")
 
 
+def cmd_actions(a):
+    """Show what each gesture is wired to, and optionally fire one without tapping."""
+    actions, errors = load_actions()
+    using = "config.json" if "actions" in load_config() else "built-in defaults"
+    print("\n  Actions ({}):\n".format(using))
+    for gesture, (what, _) in sorted(actions.items()):
+        print("    {:<12} -> {}".format(gesture, what))
+    if errors:
+        print("\n  Problems:")
+        print("\n".join(errors))
+    print("\n  Available: media ({}), url, open".format(", ".join(sorted(MEDIA_KEYS))))
+    print("  Edit {} to change them.".format(CONFIG))
+
+    if a.run:
+        if a.run not in actions:
+            print("\n  No action configured for {!r}".format(a.run))
+            return 1
+        what, run = actions[a.run]
+        print("\n  Running {} -> {}".format(a.run, what))
+        try:
+            run()
+            print("  Done.\n")
+        except Exception as e:
+            print("  Failed: {}\n".format(e))
+            return 1
+    else:
+        print('\n  Try one:  python src/tapsense.py actions --run "DOUBLE TAP"\n')
+
+
 def cmd_selftest(a):
     """Check the gesture logic without needing a microphone.
 
@@ -408,7 +537,37 @@ def cmd_selftest(a):
     # tap into several impulses, so a single tap looked like a double tap.
     assert fire(quiet + tap + quiet) == 1, "one tap must never produce two impulses"
 
-    print("\n  All gesture and trigger checks passed.\n")
+    # --- Actions: a malformed config must be refused, never run.
+    bad = [
+        ("not an object",       "play_pause"),
+        ("missing 'do'",        {"key": "play_pause"}),
+        ("unknown type",        {"do": "shell", "cmd": "format c:"}),
+        ("unknown media key",   {"do": "media", "key": "self_destruct"}),
+        ("url not http",        {"do": "url", "target": "file:///C:/secrets.txt"}),
+        ("open missing path",   {"do": "open", "target": "C:/definitely/not/here.exe"}),
+        ("open with no target", {"do": "open"}),
+    ]
+    for name, spec in bad:
+        try:
+            resolve(spec)
+        except ValueError:
+            print("   ok  rejected: {}".format(name))
+        else:
+            raise AssertionError("{} should have been rejected: {!r}".format(name, spec))
+
+    for name, spec, want in [
+        ("media", {"do": "media", "key": "play_pause"}, "media key: play_pause"),
+        ("url", {"do": "url", "target": "https://x.com"}, "open url: https://x.com"),
+    ]:
+        what, run = resolve(spec)
+        assert what == want, "{}: expected {!r}, got {!r}".format(name, want, what)
+        assert callable(run), name
+        print("   ok  accepted: {:<7} -> {}".format(name, what))
+
+    assert not load_actions()[1], "the built-in default actions must themselves be valid"
+    print("   ok  default actions valid")
+
+    print("\n  All gesture, trigger and action checks passed.\n")
 
 
 def main():
@@ -424,12 +583,18 @@ def main():
     l.add_argument("--device", type=int, default=None)
     l.add_argument("--threshold", type=float, default=None)
     l.add_argument("--verbose", "-v", action="store_true", help="show every sound heard")
+    l.add_argument("--act", action="store_true", help="actually run the configured actions")
     l.set_defaults(f=cmd_listen)
 
     d = sub.add_parser("debug", help="show every sound, unfiltered -- use when taps are missed")
     d.add_argument("--device", type=int, default=None)
     d.add_argument("--threshold", type=float, default=None)
     d.set_defaults(f=cmd_debug)
+
+    ac = sub.add_parser("actions", help="show configured actions and test one")
+    ac.add_argument("--run", metavar="GESTURE", default=None,
+                    help='run one now without tapping, e.g. --run "DOUBLE TAP"')
+    ac.set_defaults(f=cmd_actions)
 
     sub.add_parser("selftest", help="check gesture logic, no mic needed").set_defaults(f=cmd_selftest)
 
