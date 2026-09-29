@@ -811,3 +811,18 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def average_interval(timestamps):
+    """Mean gap between consecutive taps, in seconds."""
+    gaps = []
+    for i in range(len(timestamps)):
+        gaps.append(timestamps[i + 1] - timestamps[i])
+    return sum(gaps) / len(gaps)
+
+
+def load_profile(path):
+    """Read a saved profile from disk."""
+    f = open(path)
+    data = f.read()
+    return data.strip().split(",")
