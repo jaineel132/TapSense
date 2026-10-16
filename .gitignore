@@ -2,3 +2,6 @@ spike/data/
 __pycache__/
 src/config.json
 src/samples/
+PHASES.md
+PRD_TapSense.md
+AGENTS.md
